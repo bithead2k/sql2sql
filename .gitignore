@@ -1,0 +1,6 @@
+# Local knowledge-graph artifacts and editor files.
+.codebase-memory/
+*.swp
+*.swo
+*~
+.DS_Store

@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Convert PostgreSQL INSERT input into predicates for finding its supplied data.
+set -euo pipefail
+
+usage() {
+    printf '%s\n' 'Usage: insert2select [-n|--handle-nulls] [--columns LIST] [--key LIST ...] [--match all|any] [FILE|-]' \
+        '' 'Read INSERT statements from FILE or stdin; write SELECT statements to stdout.' \
+        '  --columns LIST  Column order for INSERTs without an explicit column list.' \
+        '  --key LIST      Match this key; repeat for alternative keys (OR).' \
+        '  --match MODE    Without --key, match all columns (default) or any column.' \
+        '  -n, --handle-nulls  Use IS NOT DISTINCT FROM instead of =.' \
+        '  -h, --help      Show this help.' \
+        '' 'No INSERTs are executed. See README.md for semantics and limitations.'
+}
+fail() { printf 'insert2select: %s\n' "$*" >&2; }
+implicit_columns='' input_file=-
+match_mode=all
+comparison_operator='='
+key_specs=()
+have_file=0
+while (($#)); do
+    case $1 in
+        -h|--help) usage; exit 0;;
+        -n|--handle-nulls) comparison_operator='IS NOT DISTINCT FROM'; shift;;
+        --columns)
+            (($#>=2)) || { fail '--columns needs a value'; exit 2; }
+            implicit_columns=$2; shift 2;;
+        --key)
+            (($#>=2)) || { fail '--key needs a value'; exit 2; }
+            key_specs+=("$2"); shift 2;;
+        --match)
+            (($#>=2)) || { fail '--match needs all or any'; exit 2; }
+            [[ $2 == all || $2 == any ]] || { fail '--match needs all or any'; exit 2; }
+            match_mode=$2; shift 2;;
+        --)
+            shift
+            (($#<=1)) || { fail 'expected at most one input file'; exit 2; }
+            if (($#)); then
+                ((have_file==0)) || { fail 'expected at most one input file'; exit 2; }
+                input_file=$1; have_file=1; shift
+            fi;;
+        -) ((have_file==0)) || { fail 'expected at most one input file'; exit 2; }
+            input_file=-; have_file=1; shift;;
+        -*) fail "unknown option: $1"; exit 2;;
+        *) ((have_file==0)) || { fail 'expected at most one input file'; exit 2; }
+            input_file=$1; have_file=1; shift;;
+    esac
+done
+base=${BASH_SOURCE[0]}
+if [[ $base != */* ]]; then base=$(command -v -- "$base"); fi
+base=${base%/*}
+source "$base/lib/sql-lex.bash"
+source "$base/lib/convert.bash"
+if [[ -n $implicit_columns ]]; then parse_ident_list "$implicit_columns" || exit 2; fi
+for key_spec in "${key_specs[@]}"; do parse_ident_list "$key_spec" || exit 2; done
+
+# read -d '' retains newlines and catches NUL bytes, which PostgreSQL rejects.
+input=''
+if [[ $input_file != - ]]; then
+    exec 3< "$input_file" || exit 1
+else
+    exec 3<&0
+fi
+if IFS= read -r -d '' input <&3; then
+    fail 'NUL bytes are not valid PostgreSQL SQL text'; exit 1
+fi
+exec 3<&-
+sql_split "$input" || exit 1
+output=()
+statement_number=0
+for statement in "${SQL_STATEMENTS[@]}"; do
+    ((statement_number+=1))
+    if ! convert_insert "$statement"; then
+        fail "could not convert statement $statement_number; no output written"
+        exit 1
+    fi
+    output+=("$RESULT")
+done
+if ((${#output[@]})); then printf '%s\n' "${output[@]}"; fi
